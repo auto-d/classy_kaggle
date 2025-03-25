@@ -28,7 +28,7 @@ from sklearn.model_selection import KFold
 
 def find_na(df): 
     """
-    Track down any NA values, one of a few functions that probably have one line counterparts in pandas or numpy
+    Track down any elusive NA values
     """
     for col in df.columns: 
         na = len(df[df[col].isna()])
@@ -331,8 +331,10 @@ def load_concerts(file='data/Concerts.csv'):
     # A deduplicated DF with just the mapping of year/set to composer et al 
     df.drop_duplicates(subset='set.id', keep='first', inplace=True) 
     df.set_index('set.id', inplace=True) 
+    df['location'] = df['location'].fillna(value="")
     pois = extract_pois(df, 'who') 
     composers = extract_composers(df, 'what')     
+    
     # Alarm on NAs...  
     find_na(df) 
 
@@ -429,8 +431,9 @@ def load_tickets(pois, composers, concerts_df, file='data/tickets_all.csv'):
 
     # Housekeeping 
     df.drop(['concert.name', 'who', 'what', 'price.level'], axis=1, inplace=True)
+    df.fillna(value=0, axis=1, inplace=True)
 
-    # Canary 
+    # Canary     
     find_na(df) 
 
     return df
@@ -574,41 +577,42 @@ def plot_pca2(X_train, y_train, X_test):
         plt.annotate(cluster, (center[0], center[1]), bbox=dict(boxstyle="round", fc="0.8"))
 
 @ignore_warnings(category=ConvergenceWarning)
-def apply_algorithms(X_train, y_train, splits=1, display=False): 
+def apply_algorithms(X_train, y_train, splits=3, display=False): 
     """
     Iterate over various options, looking for an optimal model given the data
     """
-    
+    lr_hparams = { 'penalty' : ('l1', 'l2', 'elasticnet'), 'C' : [x / 10 for x in range(0,10)]}
     experiments = [
-        Pipeline([('scaler', StandardScaler()), ('lr', DummyClassifier())]), 
-        Pipeline([('scaler', StandardScaler()), ('lr', LogisticRegression())]), 
-        Pipeline([('scaler', StandardScaler()), ('lr', Lasso())]), 
-        Pipeline([('scaler', StandardScaler()), ('lr', Ridge())]), 
-        Pipeline([('scaler', StandardScaler()), ('lr', RandomForestClassifier())]), 
-        Pipeline([('scaler', StandardScaler()), ('lr', SVC())]), 
+        Pipeline([('scaler', StandardScaler()), ('dummy', DummyClassifier())]), 
+        Pipeline([('scaler', StandardScaler()), ('logistic regression', LogisticRegression())]), 
+        Pipeline([('scaler', StandardScaler()), ('random forest', RandomForestClassifier())]),         
         
         # Only predicts class, no probabilities ... how to incorporate? Inherit from the class, implement the needed method... 
+        # Pipeline([('scaler', StandardScaler()), ('SVM', SVC())]), 
         # Pipeline([('scaler', StandardScaler()), ('lr', KNeighborsClassifier())]), 
 
-        #TODO: annoyingly, grid search is "built around cross validation" ... it needs a split to evaluate on, which makes 
+        #TODO: grid search is "built around cross validation" ... it needs a split to evaluate on, which makes 
         # sense but complicates our strategy here as we are already using k-folds on every pipeline so the operation 
-        # happens once only
-        Pipeline([('scaler', StandardScaler()), ('lr', GridSearchCV(LogisticRegression, cv=2, scoring='roc_auc',
-            parameters={ 'penalty' : (None, 'l1', 'l2', 'elasticnet'), 'C' : [x / 10 for x in range(0,10)]}))]), 
-    ]
+        # happens once only. do we allow it to a split on our split, or just move everything to a grid search? feels 
+        # like the latter once we confirm this approach works 
+        Pipeline([
+            ('scaler', StandardScaler()), 
+            ('grid', GridSearchCV(LogisticRegression(),lr_hparams, cv=2, scoring='roc_auc',))]),
+        ]
 
-    kf = KFold(n_splits=splits, random_state=0, shuffle=False)
+    kf = KFold(n_splits=splits, shuffle=False)
 
     for i, experiment in enumerate(experiments): 
 
-        for j, (train_index, test_index) in enumerate(kf.split(X_train)): 
-            experiment.fit_predict(X_train[train_index], y_train[train_index])
-            probs = experiment.predict_proba(X_train[test_index])
-            roc = metrics.roc_auc_score(y_train[test_index], probs[:,1])
+        roc = 0
+        for train_index, test_index in kf.split(X_train, y_train): 
+            experiment.fit(X_train.iloc[train_index], y_train.iloc[train_index])
+            probs = experiment.predict_proba(X_train.iloc[test_index])
+            roc += metrics.roc_auc_score(y_train.iloc[test_index], probs[:,1])/splits
 
-        print("Experiment {i}: {roc}")
-        if display:
-            metrics.RocCurveDisplay.from_predictions(y_train.values, positive_probs)
+        if 'grid' in experiment.named_steps.keys(): 
+            print(f"Grid search estimator pipeline: {experiment.named_steps['grid'].best_estimator_}")
+        print(f"Experiment {i}: {roc}")
 
 def generate_submission(model, test): 
     """
@@ -629,7 +633,7 @@ def main():
     # Import, clean and prepare reference data, memorializing the intersection of historical and upcoming composers/performers
     concerts_df, pois, composers = load_concerts()
     zip_df = load_zip()
-    upcoming_df, salient_pois, salient_composers = load_upcoming_concerts(pois, composers, concerts_df)
+    upcoming_df, salient_pois, salient_composers = load_upcoming_concerts(pois, composers)
 
     # Import, clean and prepare predictors
     accounts_df = load_accounts(zip_df)
@@ -655,4 +659,5 @@ def main():
     # TODO: Scale!
     #plot_pca2(X_train, y_train, X_test)
     
-    
+if __name__ == "__main__": 
+    main()
