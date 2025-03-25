@@ -1,4 +1,3 @@
-import random
 import re 
 from datetime import datetime
 import pandas as pd 
@@ -542,6 +541,19 @@ def pca2(df, clusters=8):
 
     return lowD, km_model
 
+def apply_pca2(df, clusters=8):
+    """
+    Enhance a df with 2-component PCA and the clusters that k-means identifies
+    in that 2-d space
+    """
+    lowD, km_model = pca2(df)
+    subD = df.copy()
+    subD['cluster'] = km_model.labels_ 
+    subD['lowD0'] = lowD.transpose()[0]
+    subD['lowD1'] = lowD.transpose()[1]
+    
+    return subD
+
 def plot_pca2(X_train, y_train, X_test): 
     """
     Given input
@@ -582,47 +594,68 @@ def apply_algorithms(X_train, y_train, splits=3, display=False):
     Iterate over various options, looking for an optimal model given the data
     """
     lr_hparams = { 'penalty' : ('l1', 'l2', 'elasticnet'), 'C' : [x / 10 for x in range(0,10)]}
+    rf_hparams = { 'min_samples_leaf' : range(3,5,1), 'n_estimators': range(40,50,5), 'max_depth': range(7,9,1)}
+
     experiments = [
-        Pipeline([('scaler', StandardScaler()), ('dummy', DummyClassifier())]), 
-        Pipeline([('scaler', StandardScaler()), ('logistic regression', LogisticRegression())]), 
-        Pipeline([('scaler', StandardScaler()), ('random forest', RandomForestClassifier())]),         
+        # Control
+        Pipeline([('model', DummyClassifier())]),
+        
+        # ===========
+        # Leading configurations, only record here after successful cross-validation and hparam search through GridSearch
+        Pipeline([('model', LogisticRegression())]),
+        Pipeline([('model', RandomForestClassifier(max_depth=8, min_samples_leaf=4, n_estimators=45))]),        
+        
+        # ------------
+        # Experimental models and hyperparameter tuning stuff -- these should all be gridsearch estimators, as
+        # we are delegating cross-validation to that object and relying on the ability to retrieve the optimal model 
+
+        # Random Forest
+        Pipeline([('grid', GridSearchCV(RandomForestClassifier(),rf_hparams, cv=splits, scoring='roc_auc', error_score=0))]),
+        Pipeline([('scaler', StandardScaler()), ('model', RandomForestClassifier(max_depth=8, min_samples_leaf=4, n_estimators=45))]),
+        
+        # Logistic Regression w/ L1/L2 norm penalties         
+        Pipeline([('scaler', StandardScaler()), ('grid', GridSearchCV(LogisticRegression(),lr_hparams, cv=splits, scoring='roc_auc', error_score=0))]),
         
         # Only predicts class, no probabilities ... how to incorporate? Inherit from the class, implement the needed method... 
         # Pipeline([('scaler', StandardScaler()), ('SVM', SVC())]), 
         # Pipeline([('scaler', StandardScaler()), ('lr', KNeighborsClassifier())]), 
-
-        #TODO: grid search is "built around cross validation" ... it needs a split to evaluate on, which makes 
-        # sense but complicates our strategy here as we are already using k-folds on every pipeline so the operation 
-        # happens once only. do we allow it to a split on our split, or just move everything to a grid search? feels 
-        # like the latter once we confirm this approach works 
-        Pipeline([
-            ('scaler', StandardScaler()), 
-            ('grid', GridSearchCV(LogisticRegression(),lr_hparams, cv=2, scoring='roc_auc',))]),
         ]
 
-    kf = KFold(n_splits=splits, shuffle=False)
+    winner_roc = 0 
+    winner = None
 
+    #TODO: we removed cross validation here, but 
     for i, experiment in enumerate(experiments): 
+        experiment.fit(X_train, y_train)
+        probs = experiment.predict_proba(X_train)
+        roc = metrics.roc_auc_score(y_train, probs[:,1])
 
-        roc = 0
-        for train_index, test_index in kf.split(X_train, y_train): 
-            experiment.fit(X_train.iloc[train_index], y_train.iloc[train_index])
-            probs = experiment.predict_proba(X_train.iloc[test_index])
-            roc += metrics.roc_auc_score(y_train.iloc[test_index], probs[:,1])/splits
+        print("=======================================")
+        print(f"Experiment {i}: {roc}\n")
+        print("=======================================")
 
-        if 'grid' in experiment.named_steps.keys(): 
-            print(f"Grid search estimator pipeline: {experiment.named_steps['grid'].best_estimator_}")
-        print(f"Experiment {i}: {roc}")
+        if winner_roc < roc: 
+            winner_roc = roc 
+            if 'model' in experiment.named_steps.keys():
+                winner = experiment.named_steps['model']
+            elif 'grid' in experiment.named_steps.keys(): 
+                winner = experiment.named_steps['grid'].best_estimator_
+            else: 
+                raise ValueError("Cannot extract estimator from pipeline!")
 
-def generate_submission(model, test): 
+    return winner, winner_roc
+
+def generate_submission(model, X_test, directory='submissions'): 
     """
     Generate a submission in the format expected by the competition
     """
-    # TODO: fix
-    # submit_df = pd.DataFrame() 
-    # submit_df['ID'] = X_test.index
-    # submit_df['Predicted'] = probs[:,1]
-    # submit_df.to_csv('submissions/09march_0949.csv', index=False)
+    submit_df = pd.DataFrame() 
+    submit_df['ID'] = X_test.index
+    probs = model.predict_proba(X_test)
+    submit_df['Predicted'] = probs[:,1]
+    
+    file_path = directory + '/' + datetime.now().strftime("%m%d_%H%M") + '.csv'
+    submit_df.to_csv(file_path, index=False)
 
 def main(): 
 
@@ -640,24 +673,33 @@ def main():
     tickets_df = load_tickets(salient_pois, salient_composers, concerts_df)
     subs_df = load_subscriptions()
    
+    # Append
+    
     # Generate dataframes for training
     X_train, y_train, X_test = make_train_test_sets(train_df, test_df, accounts_df)
+
+    # Check algorithm outcomes on enriched account data
+    #apply_algorithms(X_train, y_train)
 
     # Train any tributary models or inputs to the CBBDF
     #scores = predict_subscribers(lr_model, seasons, subs_df, 1) 
 
-    # Manipulate data, testing each version to see what the outcome is
-    apply_algorithms(X_train, y_train)
+    # Check algorithm outcomes with 2d features and accounts annotated by associated clusters 
+    X_train = apply_pca2(X_train)
+    model, roc = apply_algorithms(X_train, y_train)
 
-    # TODO: implement these
+    # Generate a submission off the best model 
+    X_test = apply_pca2(X_test)
+    generate_submission(model, X_test)
+
+    # ❗️ TODO: implement these!! PCA could be epic... but somehow makes NO DIFFERENCE, revisit
     # apply_algorithms(tickets_df)
     # apply_algorithms(subs_df)
     # apply_algorithms(pca(accounts_df)
 
-    # After selecting the best models, using a voting, max, something routine to join predictions
-
-    # TODO: Scale!
-    #plot_pca2(X_train, y_train, X_test)
+    # ❗️ TODO: attempt a 3d cluster and or vary the cluster params to get a better breakdown... or just go 
+    # right to ensemble method here driven by the clustering, i.e. select models for their performance on each 
+    # of the clusters, or perhaps use a voting, highest probability, or something to join predictions
     
 if __name__ == "__main__": 
     main()
