@@ -4,15 +4,12 @@ import pandas as pd
 import numpy as np 
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.preprocessing import OrdinalEncoder
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import OrdinalEncoder, OneHotEncoder, MinMaxScaler, StandardScaler, PolynomialFeatures
 from sklearn import metrics
 from sklearn.utils._testing import ignore_warnings
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, DBSCAN
 from sklearn.dummy import DummyClassifier, DummyRegressor
 from sklearn.linear_model import LogisticRegression, Lasso, Ridge
 from sklearn.ensemble import RandomForestClassifier
@@ -41,13 +38,23 @@ def scale(df, range=(0,1), omit=[]):
         if column not in omit: 
             df[column] = min_max_scale(df, column, (0,1))
 
+    return df
+
+def sum_by_index(df): 
+    """
+    Sum a (hopefully numeric) DF by it's index and return it
+    """
+    squashed = df.groupby(df.index).sum()
+    squashed.fillna(0, inplace=True)
+
+    return squashed
+
 def ordinal_feature(df, column): 
     """
     Scale a column in a DF to the provided range     
     """
     encoder = OrdinalEncoder()
-    encoder.fit(df[[column]])
-    print('Found categories ' + str(encoder.categories_))
+    encoder.fit(df[[column]])    
     ordinals = encoder.transform(df[[column]])
     return ordinals
 
@@ -429,7 +436,7 @@ def load_tickets(pois, composers, concerts_df, file='data/tickets_all.csv'):
         df[column] = df.apply(lambda x: find_poi(x.what, composer), axis=1)
 
     # Housekeeping 
-    df.drop(['concert.name', 'who', 'what', 'price.level'], axis=1, inplace=True)
+    df.drop(['concert.name', 'who', 'what', 'price.level', 'season.ordinal'], axis=1, inplace=True)
     df.fillna(value=0, axis=1, inplace=True)
 
     # Canary     
@@ -478,7 +485,7 @@ def load_subscriptions(file='data/Subscriptions.csv'):
     df['season.ordinal'] = df['season.ordinal'].astype(int) 
 
     # Remove cruft and check for any residual empty cells 
-    df.drop(['season', 'pkg', 'loc', 'sn', 'sn.nan'], axis=1, inplace=True) 
+    df.drop(['season', 'pkg', 'loc', 'sn', 'sn.nan', 'season.ordinal'], axis=1, inplace=True) 
     
     # Canary 
     find_na(df) 
@@ -529,40 +536,79 @@ def make_train_test_sets(train_df, test_df, df):
 
     return X_train, y_train, X_test 
 
-def pca2(df, clusters=8): 
+def categorize_prediction(label, pred): 
     """
-    Compress the provided dataframe into 2 dimensions to support visualization
+    What the name says 
     """
-    pca = PCA(n_components=2) 
-    pca.fit(df) 
-    lowD = pca.transform(df) 
-    km_model = KMeans(n_clusters=clusters, random_state=0, n_init="auto")
-    km_model.fit(lowD) 
+    if label and pred: 
+        return "TP"
+    elif label and not pred: 
+        return "FN"
+    elif not label and pred: 
+        return "FP"
+    elif not label and not pred: 
+        return "TN"
 
-    return lowD, km_model
+def pca2(df, cluster_method='kmeans', clusters=8): 
+    """
+    Compress the provided dataframe into 2 dimensions to support visualization, 
+    note scaling is implicit
+    """
+    scaled_df = scale(df.copy())
+
+    pca = PCA(n_components=2) 
+    pca.fit(scaled_df)
+    
+    lowD = pca.transform(scaled_df) 
+
+    if cluster_method == 'kmeans':         
+        km_model = KMeans(n_clusters=clusters, random_state=0, n_init="auto")
+        km_model.fit(lowD) 
+        centroids = km_model.cluster_centers_
+        labels = km_model.labels_
+    elif cluster_method =='dbscan': 
+        db = DBSCAN(eps=0.5, min_samples=10)
+        db.fit(lowD)
+        centroids = None
+        labels = db.labels_ 
+
+    return lowD, centroids, labels
 
 def apply_pca2(df, clusters=8):
     """
     Enhance a df with 2-component PCA and the clusters that k-means identifies
     in that 2-d space
     """
-    lowD, km_model = pca2(df)
-    subD = df.copy()
-    subD['cluster'] = km_model.labels_ 
-    subD['lowD0'] = lowD.transpose()[0]
-    subD['lowD1'] = lowD.transpose()[1]
+    lowD, centroids, labels = pca2(df)
     
-    return subD
+    df = df.copy()
+    df['d1'] = lowD.transpose()[0]
+    df['d2'] = lowD.transpose()[1]
 
-def plot_pca2(X_train, y_train, X_test): 
+    df['cluster'] = labels
+
+    return df, centroids
+
+def visualize_dataset(X_train, y_train, X_test, clusters=8): 
     """
-    Given input
+    Compress the provided training data into two dimensions, cluster on the 
+    restult and then plot, highlighting the clusters, the negative class, 
+    the positive class, the test set results. 
+
+    Note X_train can be a superset of y_train here, if we want to look at 
+    all samples we have irrespective of whether we have labels. 
     """
-    lowD, km_model = pca2(X_train)
+    #TODO: fix 
+    X_train_2d, centroids = apply_pca2(X_train, clusters)
+    lowD, km_model = pca2(X_train, clusters)
+    
+    # Clone and append the clustering and PCA features
     subD = X_train.copy()
     subD['cluster'] = km_model.labels_ 
-    subD['lowD0'] = lowD.transpose()[0]
-    subD['lowD1'] = lowD.transpose()[1]
+    subD['d1'] = lowD.transpose()[0]
+    subD['d2'] = lowD.transpose()[1]
+
+    # Create our visualization subsets
     train_sub = subD.join(y_train, how='inner') 
     pos_train_sub = train_sub[train_sub['label'] == 1]
     neg_train_sub = train_sub[train_sub['label'] == 0]
@@ -571,68 +617,121 @@ def plot_pca2(X_train, y_train, X_test):
     fig = plt.figure() 
     fig.set_size_inches(16,12) 
 
-    # All accounts in low-d space 
-    plt.scatter(lowD[:, 0], lowD[:, 1], color='blue') 
+    # Show all samples in low-d space 
+    plt.scatter(lowD[:, 0], lowD[:, 1], color='gray') 
 
-    # training - negative class
-    plt.scatter(neg_train_sub['lowD0'], neg_train_sub['lowD1'], color='red', marker='.') 
+    # Show negative class of the training set
+    plt.scatter(neg_train_sub['d1'], neg_train_sub['d2'], color='red', marker='.') 
 
-    # test set
-    plt.scatter(test_sub['lowD0'], test_sub['lowD1'], marker='.', color='orange') 
+    # Show our test set
+    plt.scatter(test_sub['d1'], test_sub['d2'], marker='.', color='orange') 
 
-    # training - positive class
-    plt.scatter(pos_train_sub['lowD0'], pos_train_sub['lowD1'], color='lime', marker='.') 
+    # Show positive class of the training set, which are the least populous and should sit 
+    # highest in the z-order to ensure visibility
+    plt.scatter(pos_train_sub['d1'], pos_train_sub['d2'], color='lime', marker='.') 
 
+    # Plot the cluster centroids and label each
     for cluster in range(1,km_model.n_clusters): 
         center = km_model.cluster_centers_[cluster] 
         plt.scatter(center[0], center[1], color='yellow', marker='D') 
         plt.annotate(cluster, (center[0], center[1]), bbox=dict(boxstyle="round", fc="0.8"))
 
+def project_results_2d(X_train, y_train, probs, threshold=0.5, clusters=8): 
+    """
+    Use PCA to prepare a flattened version of the training data and our performance on the TRAINING data predictions
+    """
+    X_train_2d, cluster_centers = apply_pca2(X_train, clusters)
+    
+    # Create a subset just for training data, and then subsets for the classes
+    viz_df = X_train_2d.join(y_train, how='inner', rsuffix='_y') 
+
+    viz_df['preds'] = [ True if prob > threshold else False for prob in probs]
+    viz_df['result'] = viz_df.apply(lambda x: categorize_prediction(x.label, x.preds), axis=1)
+
+    return viz_df, cluster_centers
+
+def visualize_results_2d(viz_df, cluster_centers, title, c_filter=None): 
+    """
+    Plot the 2d visualization, optionally with cluster centroids and/or a cluster 
+    centroid filter
+    """
+    if c_filter is not None: 
+        viz_df = viz_df[viz_df['cluster'].isin(c_filter)]
+
+    tp_sub = viz_df[viz_df['result'] == "TP"]
+    fn_sub = viz_df[viz_df['result'] == "FN"]
+    fp_sub = viz_df[viz_df['result'] == "FP"]
+    tn_sub = viz_df[viz_df['result'] == "TN"]
+    
+    fig = plt.figure()     
+    fig.set_size_inches(16,10) 
+    
+    plt.title(title)
+    plt.scatter(tn_sub['d1'], tn_sub['d2'], color='gray', marker='o', label='TN')     
+    plt.scatter(tp_sub['d1'], tp_sub['d2'], color='blue', marker='o', label='TP')     
+    plt.scatter(fn_sub['d1'], fn_sub['d2'], color='orange', marker='.', label='FN') 
+    plt.scatter(fp_sub['d1'], fp_sub['d2'], color='red', marker='.', label='FP') 
+
+    #TODO plot the DBSCAN clusters
+    if cluster_centers is not None: 
+        for cluster in range(1,len(cluster_centers)):  
+            if c_filter is None or cluster in c_filter: 
+                center = cluster_centers[cluster] 
+                plt.scatter(center[0], center[1], color='yellow', marker='D', label='Centroids') 
+                plt.annotate(cluster, (center[0], center[1]), bbox=dict(boxstyle="round", fc="0.8"))
+
+    plt.show()
+
 @ignore_warnings(category=ConvergenceWarning)
-def apply_algorithms(X_train, y_train, splits=3, display=False): 
+def bakeoff(X_train, y_train, splits=3, display=False): 
     """
     Iterate over various options, looking for an optimal model given the data
     """
     lr_hparams = { 'penalty' : ('l1', 'l2', 'elasticnet'), 'C' : [x / 10 for x in range(0,10)]}
     rf_hparams = { 'min_samples_leaf' : range(3,5,1), 'n_estimators': range(40,50,5), 'max_depth': range(7,9,1)}
+    sv_hparams = { 'C' : [x / 10 for x in range(0,10)], 'kernel' : ['sigmoid', 'rbf'] }
+    kn_hparams = { 'n_neighbors' : range(1,9,3)}
 
     experiments = [
         # Control
-        Pipeline([('model', DummyClassifier())]),
+        #Pipeline([('model', DummyClassifier())]),
         
         # ===========
-        # Leading configurations, only record here after successful cross-validation and hparam search through GridSearch
+        # Leading configurations, only record here AFTER successful cross-validation and hparam search through GridSearch
         Pipeline([('model', LogisticRegression())]),
+        Pipeline([('scaler', StandardScaler()), ('model', SVC())]),      
+        Pipeline([('scaler', StandardScaler()), ('model', KNeighborsClassifier(n_neighbors=8))]), 
         Pipeline([('model', RandomForestClassifier(max_depth=8, min_samples_leaf=4, n_estimators=45))]),        
         
         # ------------
         # Experimental models and hyperparameter tuning stuff -- these should all be gridsearch estimators, as
         # we are delegating cross-validation to that object and relying on the ability to retrieve the optimal model 
-
-        # Random Forest
-        Pipeline([('grid', GridSearchCV(RandomForestClassifier(),rf_hparams, cv=splits, scoring='roc_auc', error_score=0))]),
-        Pipeline([('scaler', StandardScaler()), ('model', RandomForestClassifier(max_depth=8, min_samples_leaf=4, n_estimators=45))]),
+        #Pipeline([('scaler', StandardScaler()), ('poly', PolynomialFeatures()), ('grid', GridSearchCV(SVC(), sv_hparams, error_score=0))]),        
+        #Pipeline([('scaler', StandardScaler()), ('poly', PolynomialFeatures()), ('grid', GridSearchCV(KNeighborsClassifier(), kn_hparams, error_score=0))]), 
         
         # Logistic Regression w/ L1/L2 norm penalties         
-        Pipeline([('scaler', StandardScaler()), ('grid', GridSearchCV(LogisticRegression(),lr_hparams, cv=splits, scoring='roc_auc', error_score=0))]),
+        #Pipeline([('grid', GridSearchCV(LogisticRegression(),lr_hparams, cv=splits, scoring='roc_auc', error_score=0))]),
         
-        # Only predicts class, no probabilities ... how to incorporate? Inherit from the class, implement the needed method... 
-        # Pipeline([('scaler', StandardScaler()), ('SVM', SVC())]), 
-        # Pipeline([('scaler', StandardScaler()), ('lr', KNeighborsClassifier())]), 
+        # Random Forest
+        #Pipeline([('grid', GridSearchCV(RandomForestClassifier(),rf_hparams, cv=splits, scoring='roc_auc', error_score=0))]),
+        #Pipeline([('scaler', StandardScaler()), ('model', RandomForestClassifier(max_depth=8, min_samples_leaf=4, n_estimators=45))]),
         ]
 
     winner_roc = 0 
     winner = None
 
-    #TODO: we removed cross validation here, but 
     for i, experiment in enumerate(experiments): 
         experiment.fit(X_train, y_train)
-        probs = experiment.predict_proba(X_train)
-        roc = metrics.roc_auc_score(y_train, probs[:,1])
+        
+        probs = None 
+        if hasattr(experiment, 'predict_proba'): 
+            probs = experiment.predict_proba(X_train)[:,1]
+        elif hasattr(experiment, 'predict'):
+            probs = experiment.predict(X_train)
 
-        print("=======================================")
-        print(f"Experiment {i}: {roc}\n")
-        print("=======================================")
+        roc = metrics.roc_auc_score(y_train, probs)
+
+        print(f"=======================================\nExperiment {i}: {roc}\n")
 
         if winner_roc < roc: 
             winner_roc = roc 
@@ -642,6 +741,9 @@ def apply_algorithms(X_train, y_train, splits=3, display=False):
                 winner = experiment.named_steps['grid'].best_estimator_
             else: 
                 raise ValueError("Cannot extract estimator from pipeline!")
+    
+            viz_df, centroids = project_results_2d(X_train, y_train, probs, threshold=0.5, clusters=8)
+            visualize_results_2d(viz_df, centroids, title=f"Pipeline {i}, Model: {str(winner)}", c_filter=[1,5,7])
 
     return winner, winner_roc
 
@@ -666,40 +768,46 @@ def main():
     # Import, clean and prepare reference data, memorializing the intersection of historical and upcoming composers/performers
     concerts_df, pois, composers = load_concerts()
     zip_df = load_zip()
-    upcoming_df, salient_pois, salient_composers = load_upcoming_concerts(pois, composers)
+    _, salient_pois, salient_composers = load_upcoming_concerts(pois, composers)
 
     # Import, clean and prepare predictors
     accounts_df = load_accounts(zip_df)
     tickets_df = load_tickets(salient_pois, salient_composers, concerts_df)
     subs_df = load_subscriptions()
-   
-    # Append
-    
-    # Generate dataframes for training
-    X_train, y_train, X_test = make_train_test_sets(train_df, test_df, accounts_df)
 
-    # Check algorithm outcomes on enriched account data
-    #apply_algorithms(X_train, y_train)
+    # Collapse and join predictors
+    feature_df = accounts_df.join(sum_by_index(tickets_df), how="left", rsuffix="_tix")
+    feature_df = feature_df.join(sum_by_index(subs_df), how="left", rsuffix="_sub")
+    feature_df.fillna(0, inplace=True)    
+    feature_df, _ = apply_pca2(feature_df)
 
     # Train any tributary models or inputs to the CBBDF
     #scores = predict_subscribers(lr_model, seasons, subs_df, 1) 
+     
+    # Generate dataframes for training
+    find_na(feature_df)
+    X_train, y_train, X_test = make_train_test_sets(train_df, test_df, feature_df)
 
-    # Check algorithm outcomes with 2d features and accounts annotated by associated clusters 
-    X_train = apply_pca2(X_train)
-    model, roc = apply_algorithms(X_train, y_train)
+    # Check algorithm outcomes on enriched account data and submit the winner
+    model, roc = bakeoff(X_train, y_train)
 
     # Generate a submission off the best model 
-    X_test = apply_pca2(X_test)
     generate_submission(model, X_test)
+
+    # TODO: am I sampling with stratification? my positive class is poorly represented ... review what we're doing 
+    # to address 
+
+    # TODO: 
+    # - RF is turning out a lot of negatives for the bottom 'bar' in the plot (cluster 3), actually so is the 
+    # grid search linear regression and 
+    # ❗️ TODO:  smoosh the logistic regression and random forest 
+    # together FTW. the clear linear relationshpi in the 2d PCA is righteous, can't we just train a 
+    # regression model on that and use it to reject anything that isn't on the line? 
 
     # ❗️ TODO: implement these!! PCA could be epic... but somehow makes NO DIFFERENCE, revisit
     # apply_algorithms(tickets_df)
     # apply_algorithms(subs_df)
     # apply_algorithms(pca(accounts_df)
-
-    # ❗️ TODO: attempt a 3d cluster and or vary the cluster params to get a better breakdown... or just go 
-    # right to ensemble method here driven by the clustering, i.e. select models for their performance on each 
-    # of the clusters, or perhaps use a voting, highest probability, or something to join predictions
     
 if __name__ == "__main__": 
     main()
