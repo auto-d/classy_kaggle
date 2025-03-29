@@ -1,4 +1,5 @@
 import re 
+import argparse
 from datetime import datetime
 import pandas as pd 
 import numpy as np 
@@ -12,15 +13,12 @@ from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans, DBSCAN
 from sklearn.dummy import DummyClassifier, DummyRegressor
 from sklearn.linear_model import LogisticRegression, Lasso, Ridge
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.svm import SVC
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import GridSearchCV, train_test_split, KFold
 from sklearn.pipeline import Pipeline
 from sklearn.datasets import make_classification
-from sklearn.model_selection import train_test_split
-from sklearn.model_selection import GridSearchCV
-from sklearn.model_selection import KFold
 
 def find_na(df): 
     """
@@ -296,10 +294,10 @@ def load_accounts(zip_df, file='data/account.csv'):
 
     # Opt for ordinal encoding of relationship - 
     # TODO: this should be one-hot!
-    df['relationship.encoded'] = ordinal_feature(df, 'relationship')
+    rel_df = onehot_feature(df, 'relationship') 
+    df = pd.concat([df, rel_df], axis=1)
     
     # Housekeeping
-    df['relationship.encoded'] = df['relationship.encoded'].fillna(value=0) 
     df.drop(['relationship'], axis=1, inplace=True)
 
     # Convert date and scale
@@ -589,53 +587,6 @@ def apply_pca2(df, clusters=8):
 
     return df, centroids
 
-def visualize_dataset(X_train, y_train, X_test, clusters=8): 
-    """
-    Compress the provided training data into two dimensions, cluster on the 
-    restult and then plot, highlighting the clusters, the negative class, 
-    the positive class, the test set results. 
-
-    Note X_train can be a superset of y_train here, if we want to look at 
-    all samples we have irrespective of whether we have labels. 
-    """
-    #TODO: fix 
-    X_train_2d, centroids = apply_pca2(X_train, clusters)
-    lowD, km_model = pca2(X_train, clusters)
-    
-    # Clone and append the clustering and PCA features
-    subD = X_train.copy()
-    subD['cluster'] = km_model.labels_ 
-    subD['d1'] = lowD.transpose()[0]
-    subD['d2'] = lowD.transpose()[1]
-
-    # Create our visualization subsets
-    train_sub = subD.join(y_train, how='inner') 
-    pos_train_sub = train_sub[train_sub['label'] == 1]
-    neg_train_sub = train_sub[train_sub['label'] == 0]
-    test_sub = subD.join(X_test, how='inner', rsuffix='_') 
-
-    fig = plt.figure() 
-    fig.set_size_inches(16,12) 
-
-    # Show all samples in low-d space 
-    plt.scatter(lowD[:, 0], lowD[:, 1], color='gray') 
-
-    # Show negative class of the training set
-    plt.scatter(neg_train_sub['d1'], neg_train_sub['d2'], color='red', marker='.') 
-
-    # Show our test set
-    plt.scatter(test_sub['d1'], test_sub['d2'], marker='.', color='orange') 
-
-    # Show positive class of the training set, which are the least populous and should sit 
-    # highest in the z-order to ensure visibility
-    plt.scatter(pos_train_sub['d1'], pos_train_sub['d2'], color='lime', marker='.') 
-
-    # Plot the cluster centroids and label each
-    for cluster in range(1,km_model.n_clusters): 
-        center = km_model.cluster_centers_[cluster] 
-        plt.scatter(center[0], center[1], color='yellow', marker='D') 
-        plt.annotate(cluster, (center[0], center[1]), bbox=dict(boxstyle="round", fc="0.8"))
-
 def project_results_2d(X_train, y_train, probs, threshold=0.5, clusters=8): 
     """
     Use PCA to prepare a flattened version of the training data and our performance on the TRAINING data predictions
@@ -655,7 +606,7 @@ def visualize_results_2d(viz_df, cluster_centers, title, c_filter=None):
     Plot the 2d visualization, optionally with cluster centroids and/or a cluster 
     centroid filter
     """
-    if c_filter is not None: 
+    if c_filter is not None and c_filter != []: 
         viz_df = viz_df[viz_df['cluster'].isin(c_filter)]
 
     tp_sub = viz_df[viz_df['result'] == "TP"]
@@ -672,7 +623,7 @@ def visualize_results_2d(viz_df, cluster_centers, title, c_filter=None):
     plt.scatter(fn_sub['d1'], fn_sub['d2'], color='orange', marker='.', label='FN') 
     plt.scatter(fp_sub['d1'], fp_sub['d2'], color='red', marker='.', label='FP') 
 
-    #TODO plot the DBSCAN clusters
+    # Note we are not plotting the DBscan clusters here, something to improve on 
     if cluster_centers is not None: 
         for cluster in range(1,len(cluster_centers)):  
             if c_filter is None or cluster in c_filter: 
@@ -683,42 +634,13 @@ def visualize_results_2d(viz_df, cluster_centers, title, c_filter=None):
     plt.show()
 
 @ignore_warnings(category=ConvergenceWarning)
-def bakeoff(X_train, y_train, splits=3, display=False): 
+def bakeoff(experiments, X_train, y_train, visualize=False): 
     """
-    Iterate over various options, looking for an optimal model given the data
+    Iterate over various options, looking for an optimal model given the data. This 
+    function expects all cross-validation to happen within the model pipeline. 
     """
-    lr_hparams = { 'penalty' : ('l1', 'l2', 'elasticnet'), 'C' : [x / 10 for x in range(0,10)]}
-    rf_hparams = { 'min_samples_leaf' : range(3,5,1), 'n_estimators': range(40,50,5), 'max_depth': range(7,9,1)}
-    sv_hparams = { 'C' : [x / 10 for x in range(0,10)], 'kernel' : ['sigmoid', 'rbf'] }
-    kn_hparams = { 'n_neighbors' : range(1,9,3)}
-
-    experiments = [
-        # Control
-        #Pipeline([('model', DummyClassifier())]),
-        
-        # ===========
-        # Leading configurations, only record here AFTER successful cross-validation and hparam search through GridSearch
-        Pipeline([('model', LogisticRegression())]),
-        Pipeline([('scaler', StandardScaler()), ('model', SVC())]),      
-        Pipeline([('scaler', StandardScaler()), ('model', KNeighborsClassifier(n_neighbors=8))]), 
-        Pipeline([('model', RandomForestClassifier(max_depth=8, min_samples_leaf=4, n_estimators=45))]),        
-        
-        # ------------
-        # Experimental models and hyperparameter tuning stuff -- these should all be gridsearch estimators, as
-        # we are delegating cross-validation to that object and relying on the ability to retrieve the optimal model 
-        #Pipeline([('scaler', StandardScaler()), ('poly', PolynomialFeatures()), ('grid', GridSearchCV(SVC(), sv_hparams, error_score=0))]),        
-        #Pipeline([('scaler', StandardScaler()), ('poly', PolynomialFeatures()), ('grid', GridSearchCV(KNeighborsClassifier(), kn_hparams, error_score=0))]), 
-        
-        # Logistic Regression w/ L1/L2 norm penalties         
-        #Pipeline([('grid', GridSearchCV(LogisticRegression(),lr_hparams, cv=splits, scoring='roc_auc', error_score=0))]),
-        
-        # Random Forest
-        #Pipeline([('grid', GridSearchCV(RandomForestClassifier(),rf_hparams, cv=splits, scoring='roc_auc', error_score=0))]),
-        #Pipeline([('scaler', StandardScaler()), ('model', RandomForestClassifier(max_depth=8, min_samples_leaf=4, n_estimators=45))]),
-        ]
-
     winner_roc = 0 
-    winner = None
+    winner = None    
 
     for i, experiment in enumerate(experiments): 
         experiment.fit(X_train, y_train)
@@ -731,36 +653,29 @@ def bakeoff(X_train, y_train, splits=3, display=False):
 
         roc = metrics.roc_auc_score(y_train, probs)
 
-        print(f"=======================================\nExperiment {i}: {roc}\n")
+        print(f"==== \nExperiment {i}: {roc}\n")
+
+        if 'model' in experiment.named_steps.keys():
+            model = experiment.named_steps['model']
+        elif 'grid' in experiment.named_steps.keys(): 
+            model = experiment.named_steps['grid'].best_estimator_
+        else: 
+            raise ValueError("Cannot extract estimator from pipeline!")
 
         if winner_roc < roc: 
             winner_roc = roc 
-            if 'model' in experiment.named_steps.keys():
-                winner = experiment.named_steps['model']
-            elif 'grid' in experiment.named_steps.keys(): 
-                winner = experiment.named_steps['grid'].best_estimator_
-            else: 
-                raise ValueError("Cannot extract estimator from pipeline!")
+            winner = model 
     
+        if visualize: 
             viz_df, centroids = project_results_2d(X_train, y_train, probs, threshold=0.5, clusters=8)
-            visualize_results_2d(viz_df, centroids, title=f"Pipeline {i}, Model: {str(winner)}", c_filter=[1,5,7])
+            visualize_results_2d(viz_df, centroids, title=f"Pipeline {i}, Model: {str(winner)}", c_filter=[])
 
     return winner, winner_roc
 
-def generate_submission(model, X_test, directory='submissions'): 
+def build_train_set():
     """
-    Generate a submission in the format expected by the competition
+    Load, transform, and apply engineered features, returning the training set
     """
-    submit_df = pd.DataFrame() 
-    submit_df['ID'] = X_test.index
-    probs = model.predict_proba(X_test)
-    submit_df['Predicted'] = probs[:,1]
-    
-    file_path = directory + '/' + datetime.now().strftime("%m%d_%H%M") + '.csv'
-    submit_df.to_csv(file_path, index=False)
-
-def main(): 
-
     # Import train and test indices
     train_df = load_train()
     test_df = load_test()
@@ -786,28 +701,175 @@ def main():
      
     # Generate dataframes for training
     find_na(feature_df)
-    X_train, y_train, X_test = make_train_test_sets(train_df, test_df, feature_df)
 
+    return make_train_test_sets(train_df, test_df, feature_df)
+
+def generate_submission(model, X_test, directory='submissions'): 
+    """
+    Generate a submission in the format expected by the competition
+    """
+    submit_df = pd.DataFrame() 
+    submit_df['ID'] = X_test.index
+    probs = model.predict_proba(X_test)
+    submit_df['Predicted'] = probs[:,1]
+        
+    file_path = directory + '/' + datetime.now().strftime("%m%d_%H%M") + '.csv'    
+    submit_df.to_csv(file_path, index=False)
+    print(f"Wrote submission for model {model} to {file_path}.")
+
+lr_hparams = { 'penalty' : ('l1', 'l2', 'elasticnet'), 'C' : [x / 10 for x in range(0,10)]}
+rf_hparams = { 'min_samples_leaf' : range(3,5,1), 'n_estimators': range(40,50,5), 'max_depth': range(7,9,1)}
+sv_hparams = { 'C' : [x / 10 for x in range(1,5,2)], 'kernel' : ['sigmoid', 'rbf'] }
+kn_hparams = { 'n_neighbors' : range(7,9)}
+
+def search(splits=3, submit=False, visualize=False):  
+    """
+    Perform a hyperparameter and model search across all promising algorithms
+    """
+    X_train, y_train, X_test = build_train_set()
+
+    experiments = [
+        # Control
+        #Pipeline([('model', DummyClassifier())]),
+
+        # Experimental models and hyperparameter tuning stuff -- these should all be gridsearch estimators, as
+        # we are delegating cross-validation to that object and relying on the ability to retrieve the optimal model 
+        Pipeline([('scaler', StandardScaler()), ('poly', PolynomialFeatures()), ('grid', GridSearchCV(SVC(), sv_hparams, error_score=0))]),
+        Pipeline([('scaler', StandardScaler()), ('pca', PCA(n_components=15)), ('grid', GridSearchCV(SVC(), sv_hparams, error_score=0))]),
+        Pipeline([('scaler', StandardScaler()), ('pca', PCA(n_components=12)), ('grid', GridSearchCV(SVC(), sv_hparams, error_score=0))]),
+
+        Pipeline([('scaler', StandardScaler()), ('poly', PolynomialFeatures()), ('grid', GridSearchCV(KNeighborsClassifier(), kn_hparams, error_score=0))]), 
+        
+        # Logistic Regression w/ L1/L2 norm penalties         
+        Pipeline([('grid', GridSearchCV(LogisticRegression(),lr_hparams, cv=splits, scoring='roc_auc', error_score=0))]),
+
+        # Random forest         
+        Pipeline([('grid', GridSearchCV(RandomForestClassifier(),rf_hparams, cv=splits, scoring='roc_auc', error_score=0))]),
+        
+        # PCA + LR
+        Pipeline([('scaler', StandardScaler()), ('pca3', PCA(n_components=12)), ('model', SVC(kernel='rbf'))]),
+        Pipeline([('scaler', StandardScaler()), ('pca3', PCA(n_components=5)), ('model', SVC(kernel='rbf'))]),
+        Pipeline([('scaler', StandardScaler()), ('pca3', PCA(n_components=12)), ('model', SVC(kernel='sigmoid'))]),
+        Pipeline([('scaler', StandardScaler()), ('pca6', PCA(n_components=26)), ('model', LogisticRegression(penalty=None))]),
+        Pipeline([('scaler', StandardScaler()), ('pca8', PCA(n_components=8)), ('model', LogisticRegression(penalty=None))]),
+    ]
+    
     # Check algorithm outcomes on enriched account data and submit the winner
-    model, roc = bakeoff(X_train, y_train)
+    winner, roc = bakeoff(experiments, X_train, y_train, visualize)
 
-    # Generate a submission off the best model 
-    generate_submission(model, X_test)
+    print(f"Best model identified: {winner} (AUROC of {roc}).")
+
+    if submit:
+        generate_submission(winner, X_test)
+
+def test(splits=5, submit=False, visualize=False): 
+    """
+    Test the most promising model configurations using cross validation    
+    """
+   
+    candidates = [        
+        # Candidate models and hyperparameters reseulting from search operations 
+        # Note estimator must be tagged w/ 'model' 
+        Pipeline([('scaler', StandardScaler()), ('pca', PCA(n_components=7)), ('model', LogisticRegression(penalty=None))]),
+        Pipeline([('scaler', StandardScaler()), ('pca4', PCA(n_components=34)), ('model', LogisticRegression(penalty=None))]),
+        Pipeline([('model', RandomForestClassifier(max_depth=8, min_samples_leaf=4, n_estimators=45))]),
+        Pipeline([('scaler', StandardScaler()), ('model', KNeighborsClassifier(n_neighbors=8))]), 
+        Pipeline([('model', VotingClassifier(
+            estimators=[
+                ('RF', RandomForestClassifier(max_depth=9, min_samples_leaf=4, n_estimators=40)), 
+                ('KNN', Pipeline([('scaler', StandardScaler()), ('model', KNeighborsClassifier(n_neighbors=8))])), 
+                ],
+            voting='soft'))]),
+        Pipeline([('model', VotingClassifier(
+            estimators=[
+                ('RF', RandomForestClassifier(max_depth=8, min_samples_leaf=4, n_estimators=70)), 
+                ('KNN', Pipeline([('scaler', StandardScaler()), ('model', KNeighborsClassifier(n_neighbors=8))])), 
+                ],
+            voting='soft'))]),
+        # This performs best on internal validation, but is a few tenths below the above voting classifier on the hidden 
+        # test data. Keep it here for potential mutation. 
+        # Pipeline([('model', VotingClassifier(
+        #     estimators=[
+        #         ('RF', RandomForestClassifier(max_depth=8, min_samples_leaf=4, n_estimators=45)), 
+        #         ('KNN', Pipeline([('scaler', StandardScaler()), ('model', KNeighborsClassifier(n_neighbors=8))])), 
+        #         ('LR', Pipeline([('scaler', StandardScaler()), ('pca4', PCA(n_components=34)), ('model', LogisticRegression(penalty=None))])),
+        #         ],
+        #     voting='soft'))]),
+    ]
+
+    X_train, y_train, X_test = build_train_set()    
+    kf = KFold(n_splits=splits, shuffle=False)
+
+    winner_roc = 0
+    winner = None
+    
+    # Iterate over the candidate models and evalute on k folds of the data
+    for candidate in candidates: 
+
+        roc = 0 
+        for train_ix, test_ix in kf.split(X_train, y_train):            
+            candidate.fit(X_train.iloc[train_ix], y_train.iloc[train_ix])
+        
+            probs = None 
+            if hasattr(candidate, 'predict_proba'): 
+                probs = candidate.predict_proba(X_train.iloc[test_ix])[:,1]
+            elif hasattr(candidate, 'predict'):
+                probs = candidate.predict(X_train.iloc[test_ix])
+
+            roc += metrics.roc_auc_score(y_train.iloc[test_ix], probs)/splits
+
+        # Retrain in preparation for visualization or submission
+        model = candidate.named_steps['model']
+        print(f"======== \nCandidate {model}: {roc}\n")
+        model.fit(X_train, y_train)
+            
+        if winner_roc < roc: 
+            winner_roc = roc 
+            winner = model 
+        
+        # If we're going to plot, we need updated predictions
+        if visualize:          
+            probs = None 
+            if hasattr(model, 'predict_proba'): 
+                probs = model.predict_proba(X_train)[:,1]
+            elif hasattr(model, 'predict'):
+                probs = model.predict(X_train)
+
+            viz_df, centroids = project_results_2d(X_train, y_train, probs, threshold=0.5, clusters=8)
+            visualize_results_2d(viz_df, centroids, title=f"Model: {str(model)} @ {roc}", c_filter=None)
+    
+    if submit:
+        generate_submission(winner, X_test)
 
     # TODO: am I sampling with stratification? my positive class is poorly represented ... review what we're doing 
     # to address 
-
-    # TODO: 
-    # - RF is turning out a lot of negatives for the bottom 'bar' in the plot (cluster 3), actually so is the 
-    # grid search linear regression and 
-    # ❗️ TODO:  smoosh the logistic regression and random forest 
-    # together FTW. the clear linear relationshpi in the 2d PCA is righteous, can't we just train a 
-    # regression model on that and use it to reject anything that isn't on the line? 
 
     # ❗️ TODO: implement these!! PCA could be epic... but somehow makes NO DIFFERENCE, revisit
     # apply_algorithms(tickets_df)
     # apply_algorithms(subs_df)
     # apply_algorithms(pca(accounts_df)
+
+def main(**args): 
+    """
+    CLI entry point and arg handler
+    """
+    parser = argparse.ArgumentParser()
+    group = parser.add_mutually_exclusive_group() 
+    group.add_argument("-s", "--search", action=argparse.BooleanOptionalAction)
+    group.add_argument("-t", "--test", action=argparse.BooleanOptionalAction)
+    parser.add_argument("-k", "--splits")
+    parser.add_argument("-v", "--visualize", action=argparse.BooleanOptionalAction)
+    parser.add_argument("-g", "--generate", action=argparse.BooleanOptionalAction)
     
+    parser.set_defaults(search=False, test=False, visualize=False, generate=False)
+    args = parser.parse_args()
+    if args.search: 
+        search(int(args.splits), args.generate, args.visualize)
+    elif args.test: 
+        test(int(args.splits), args.generate, args.visualize)
+    else: 
+        parser.print_help()
+
 if __name__ == "__main__": 
     main()
+    
